@@ -1,0 +1,78 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "train_debug",
+            "type": "debugpy",
+            "request": "launch",
+            // 修改 program 为 torchrun
+            "program": "/ssdwork/liujinxin/miniconda3/envs/cogact/bin/torchrun",
+            "cwd": "${workspaceFolder}",
+            // 修改 args 以包含 torchrun 的参数和原有的训练脚本参数
+            "args": [
+                "--standalone",
+                "--nnodes",
+                "1",
+                "--nproc-per-node",
+                "1",
+                "${workspaceFolder}/scripts/train.py",
+                "--pretrained_checkpoint",
+                "/liujinxin/code/CogACT/models/CogACT-Base/checkpoints/CogACT-Base.pt",
+                "--vla.type",
+                "prism-dinosiglip-224px+oxe+diffusion",
+                "--vla.data_mix",
+                "libero_spatial_no_noops",
+                "--vla.expected_world_size",
+                "1",
+                "--vla.global_batch_size",
+                "2",
+                "--vla.per_device_batch_size",
+                "2",
+                "--vla.learning_rate",
+                "2e-5",
+                "--data_root_dir",
+                "/liujinxin/code/rlds_dataset_builder/tensorflow_datasets/datasets--openvla--modified_libero_rlds",
+                "--run_root_dir",
+                "./logs",
+                "--run_id",
+                "debug",
+                "--image_aug",
+                "True",
+                "--wandb_project",
+                "CogACT_debug",
+                "--wandb_entity",
+                "yijiulanpishu",
+                "--save_interval",
+                "1000",
+                "--repeated_diffusion_steps",
+                "8",
+                "--future_action_window_size",
+                "15",
+                "--action_model_type",
+                "DiT-B",
+                "--is_resume",
+                "False"
+            ],
+            "justMyCode": true,
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "inference",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/serve/flask_server.py",
+            "justMyCode": false,
+            "console": "integratedTerminal"
+        }
+    ]
+}

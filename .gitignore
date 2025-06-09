@@ -139,7 +139,6 @@ dmypy.json
 
 # IDE Caches
 .idea/
-.vscode/
 
 # Mac OS
 .DS_Store

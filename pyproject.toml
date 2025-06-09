@@ -53,7 +53,6 @@ dependencies = [
     "tensorflow_datasets==4.9.3",
     "tensorflow_graphics==2021.12.3",
     "dlimp @ git+https://github.com/moojink/dlimp_openvla",
-    "openvla @ git+https://github.com/arnoldland/openvla",         # For data loader and prismatic VLM. Here we modify and use the dataloader of OpenVLA
 ]
 
 [project.optional-dependencies]

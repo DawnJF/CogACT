@@ -19,6 +19,7 @@ from prismatic.models.vlms import PrismaticVLM
 from prismatic.overwatch import initialize_overwatch
 
 from vla import CogACT
+from vla.cogvla import VLMCogACT
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
@@ -26,6 +27,7 @@ overwatch = initialize_overwatch(__name__)
 
 # === HF Hub Repository ===
 HF_HUB_REPO = "TRI-ML/prismatic-vlms"
+
 
 # === Available Models ===
 def available_models() -> List[str]:
@@ -115,6 +117,7 @@ def load(
 
     return vlm
 
+
 # === Load Pretrained VLA Model ===
 def load_vla(
     model_id_or_path: Union[str, Path],
@@ -156,9 +159,7 @@ def load_vla(
         overwatch.info(f"Downloading Model `{model_id_or_path}` Config & Checkpoint `{target_ckpt}`")
         with overwatch.local_zero_first():
             # relpath = Path(model_type) / model_id_or_path
-            config_json = hf_hub_download(
-                repo_id=model_id_or_path, filename=f"{('config.json')!s}", cache_dir=cache_dir
-            )
+            config_json = hf_hub_download(repo_id=model_id_or_path, filename=f"{('config.json')!s}", cache_dir=cache_dir)
             dataset_statistics_json = hf_hub_download(
                 repo_id=model_id_or_path, filename=f"{('dataset_statistics.json')!s}", cache_dir=cache_dir
             )
@@ -211,6 +212,36 @@ def load_vla(
         llm_backbone,
         arch_specifier=model_cfg.arch_specifier,
         freeze_weights=not load_for_training,
+        norm_stats=norm_stats,
+        **kwargs,
+    )
+
+    return vla
+
+
+def init_vla(
+    model_id_or_path: Union[str, Path],
+    **kwargs,
+) -> VLMCogACT:
+
+    overwatch.info(f"Loading from local checkpoint path `{(checkpoint_pt := Path(model_id_or_path))}`")
+
+    # [Validate] Checkpoint Path should look like `.../<RUN_ID>/checkpoints/<CHECKPOINT_PATH>.pt`
+    assert (checkpoint_pt.suffix == ".pt") and (checkpoint_pt.parent.name == "checkpoints"), "Invalid checkpoint!"
+    run_dir = checkpoint_pt.parents[1]
+
+    # Get paths for `config.json`, `dataset_statistics.json` and pretrained checkpoint
+    config_json, dataset_statistics_json = run_dir / "config.json", run_dir / "dataset_statistics.json"
+    assert config_json.exists(), f"Missing `config.json` for `{run_dir = }`"
+    assert dataset_statistics_json.exists(), f"Missing `dataset_statistics.json` for `{run_dir = }`"
+
+    # Load Dataset Statistics for Action Denormalization
+    with open(dataset_statistics_json, "r") as f:
+        norm_stats = json.load(f)
+
+    vla = VLMCogACT.from_pretrained(
+        checkpoint_pt,
+        qwen_model_path="",
         norm_stats=norm_stats,
         **kwargs,
     )

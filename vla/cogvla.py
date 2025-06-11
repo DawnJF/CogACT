@@ -1,6 +1,9 @@
 """
 
 使用Qwen2.5-VL-72B作为视觉语言模型的CogACT实现
+考虑两个情况：
+1. 多卡训练
+2. 少量卡推理
 """
 
 from __future__ import annotations
@@ -73,7 +76,7 @@ class CrossAttention(nn.Module):
         return cognition_features
 
 
-class CogACT(nn.Module):
+class VLMCogACT(nn.Module):
     def __init__(
         self,
         qwen_model_path: str = "Qwen/Qwen2.5-VL-72B-Instruct",
@@ -85,15 +88,44 @@ class CogACT(nn.Module):
         use_ema: bool = False,
         norm_stats: Dict[str, Dict[str, Dict[str, Dict[str, List[float]]]]] = None,
         cross_attn_heads: int = 8,
+        # 简化设备管理参数，专为A100优化
+        qwen_device_map: Union[str, Dict] = "auto",
+        trainable_device: int = 0,
+        max_memory_per_gpu: str = "70GB",  # A100 80GB，保留10GB给其他操作
+        low_cpu_mem_usage: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
 
-        # 初始化Qwen2.5-VL-72B模型
-        self.qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
-            qwen_model_path, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True
-        )
-        self.qwen_processor = AutoProcessor.from_pretrained(qwen_model_path)
+        # 设备管理配置
+        self.qwen_device_map = qwen_device_map
+        self.trainable_device = trainable_device
+        self.max_memory_per_gpu = max_memory_per_gpu
+
+        # 初始化Qwen2.5-VL-72B模型，使用优化的设备映射
+        overwatch.info(f"加载Qwen模型: {qwen_model_path}")
+
+        try:
+            self.qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
+                qwen_model_path,
+                torch_dtype=torch.float32,  # A100支持，直接使用float32
+                device_map=qwen_device_map,
+                trust_remote_code=True,
+                low_cpu_mem_usage=low_cpu_mem_usage,
+                max_memory=(
+                    {i: max_memory_per_gpu for i in range(torch.cuda.device_count())}
+                    if isinstance(qwen_device_map, str)
+                    else None
+                ),
+            )
+
+            self.qwen_processor = AutoProcessor.from_pretrained(qwen_model_path, trust_remote_code=True)
+
+            overwatch.info("Qwen模型加载成功")
+
+        except Exception as e:
+            overwatch.error(f"Qwen模型加载失败: {e}")
+            raise
 
         # 完全冻结Qwen参数
         self.qwen_model.requires_grad_(False)
@@ -102,7 +134,7 @@ class CogACT(nn.Module):
         # 获取Qwen的隐藏维度
         qwen_hidden_dim = self.qwen_model.config.hidden_size
 
-        # 交叉注意力模块用于生成认知特征
+        # 交叉注意力模块用于生成认知特征 - 放在指定的可训练设备上
         self.cross_attention = CrossAttention(qwen_hidden_dim, cross_attn_heads)
 
         # 如果token_size与qwen_hidden_dim不匹配，添加投影层
@@ -111,7 +143,7 @@ class CogACT(nn.Module):
         else:
             self.cognition_projector = nn.Identity()
 
-        # 动作模型
+        # 动作模型 - 也放在可训练设备上
         self.action_model = ActionModel(
             model_type=action_model_type,
             token_size=token_size,
@@ -120,6 +152,13 @@ class CogACT(nn.Module):
             past_action_window_size=past_action_window_size,
         )
 
+        # 将可训练模块移动到指定设备
+        trainable_device = f"cuda:{trainable_device}" if isinstance(trainable_device, int) else trainable_device
+        self.cross_attention = self.cross_attention.to(trainable_device)
+        if not isinstance(self.cognition_projector, nn.Identity):
+            self.cognition_projector = self.cognition_projector.to(trainable_device)
+        self.action_model = self.action_model.to(trainable_device)
+
         self.future_action_window_size = future_action_window_size
         self.past_action_window_size = past_action_window_size
         self.use_ema = use_ema
@@ -127,6 +166,7 @@ class CogACT(nn.Module):
         if self.use_ema:
             self.ema_diffusion = deepcopy(self.action_model)
             self.ema_diffusion.requires_grad_(False)
+            self.ema_diffusion = self.ema_diffusion.to(trainable_device)
             self.all_module_keys = ["action_model", "ema_diffusion", "cross_attention", "cognition_projector"]
         else:
             self.all_module_keys = ["action_model", "cross_attention", "cognition_projector"]
@@ -135,6 +175,24 @@ class CogACT(nn.Module):
         self._trainable_module_keys = ["action_model", "cross_attention", "cognition_projector"]
         self.norm_stats = norm_stats
 
+        # 记录内存使用情况
+        self._log_model_memory_usage()
+
+    def _log_model_memory_usage(self):
+        """记录模型内存使用情况"""
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                allocated = torch.cuda.memory_allocated(i) / 1024**3
+                reserved = torch.cuda.memory_reserved(i) / 1024**3
+                if allocated > 0 or reserved > 0:
+                    overwatch.info(f"GPU {i} 内存使用: 已分配 {allocated:.2f}GB, 已保留 {reserved:.2f}GB")
+
+    def enable_gradient_checkpointing(self):
+        """启用梯度检查点以节省内存"""
+        if hasattr(self.action_model, "enable_gradient_checkpointing"):
+            self.action_model.enable_gradient_checkpointing()
+        overwatch.info("已启用梯度检查点")
+
     @property
     def trainable_module_keys(self) -> List[str]:
         """返回可训练模块的键列表"""
@@ -142,8 +200,7 @@ class CogACT(nn.Module):
 
     @property
     def device(self):
-        """返回模型设备"""
-        # 修复device属性 - 使用cross_attention的device作为参考
+        """返回可训练模块的设备"""
         return next(self.cross_attention.parameters()).device
 
     def extract_qwen_hidden_states(
@@ -154,7 +211,7 @@ class CogACT(nn.Module):
         max_new_tokens: int = 100,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        从Qwen模型中提取自回归生成的隐状态
+        从Qwen模型中提取自回归生成的隐状态，优化内存使用
 
         Args:
             pixel_values: 图像张量
@@ -167,61 +224,75 @@ class CogACT(nn.Module):
             generation_attention_mask: [B, total_seq_len] 生成序列的注意力掩码
         """
         with torch.no_grad():
-            # 确保输入在正确的设备上
-            input_ids = input_ids.to(self.qwen_model.device)
-            pixel_values = pixel_values.to(self.qwen_model.device)
+            # 确保输入在正确的设备上 - Qwen模型可能分布在多个设备上
+            # 我们需要将输入数据发送到Qwen模型的第一个设备
+            qwen_device = next(self.qwen_model.parameters()).device
+
+            input_ids = input_ids.to(qwen_device)
+            pixel_values = pixel_values.to(qwen_device)
             if attention_mask is not None:
-                attention_mask = attention_mask.to(self.qwen_model.device)
+                attention_mask = attention_mask.to(qwen_device)
 
-            # 使用Qwen生成，获取隐状态
-            outputs = self.qwen_model.generate(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                output_hidden_states=True,
-                return_dict_in_generate=True,
-                do_sample=False,  # 确定性生成
-                pad_token_id=self.qwen_processor.tokenizer.eos_token_id,
-            )
-
-            # 提取所有生成步骤的最后一层隐状态
-            batch_size = input_ids.shape[0]
-            hidden_dim = self.qwen_model.config.hidden_size
-
-            # 收集所有时间步的最后一层隐状态
-            all_hidden_states = []
-
-            # 添加初始序列的隐状态（从第一个生成步骤获取）
-            if len(outputs.hidden_states) > 0:
-                # 第一个生成步骤包含完整的输入序列隐状态
-                first_step_hidden = outputs.hidden_states[0][-1]  # 最后一层
-                all_hidden_states.append(first_step_hidden)
-
-                # 添加后续生成的token隐状态
-                for step_idx in range(1, len(outputs.hidden_states)):
-                    step_hidden = outputs.hidden_states[step_idx][-1]  # 最后一层
-                    # 只取新生成的token（最后一个）
-                    new_token_hidden = step_hidden[:, -1:, :]  # [B, 1, hidden_dim]
-                    all_hidden_states.append(new_token_hidden)
-
-            # 拼接所有隐状态
-            if all_hidden_states:
-                hidden_states = torch.cat(all_hidden_states, dim=1)  # [B, total_seq_len, hidden_dim]
-            else:
-                # 后备方案：如果没有隐状态，创建零张量
-                total_seq_len = input_ids.shape[1] + max_new_tokens
-                hidden_states = torch.zeros(
-                    batch_size, total_seq_len, hidden_dim, device=self.qwen_model.device, dtype=torch.bfloat16
+            try:
+                outputs = self.qwen_model.generate(
+                    input_ids=input_ids,
+                    pixel_values=pixel_values,
+                    attention_mask=attention_mask,
+                    max_new_tokens=min(max_new_tokens, 50),
+                    output_hidden_states=True,
+                    return_dict_in_generate=True,
+                    do_sample=False,
+                    pad_token_id=self.qwen_processor.tokenizer.eos_token_id,
+                    use_cache=True,
                 )
 
-            # 创建对应的注意力掩码
-            total_seq_len = hidden_states.shape[1]
-            generation_attention_mask = torch.ones(
-                batch_size, total_seq_len, device=self.qwen_model.device, dtype=torch.bool
-            )
+                # 提取隐状态并移动到可训练模块的设备
+                batch_size = input_ids.shape[0]
+                hidden_dim = self.qwen_model.config.hidden_size
+                trainable_device = self.device
 
-            return hidden_states, generation_attention_mask
+                # 收集所有时间步的最后一层隐状态
+                all_hidden_states = []
+
+                # 处理生成的隐状态
+                if len(outputs.hidden_states) > 0:
+                    # 第一个生成步骤包含完整的输入序列隐状态
+                    first_step_hidden = outputs.hidden_states[0][-1].to(trainable_device)  # 移动到可训练设备
+                    all_hidden_states.append(first_step_hidden)
+
+                    # 添加后续生成的token隐状态
+                    for step_idx in range(1, len(outputs.hidden_states)):
+                        step_hidden = outputs.hidden_states[step_idx][-1]  # 最后一层
+                        # 只取新生成的token（最后一个）
+                        new_token_hidden = step_hidden[:, -1:, :].to(trainable_device)  # 移动到可训练设备
+                        all_hidden_states.append(new_token_hidden)
+
+                # 拼接所有隐状态
+                if all_hidden_states:
+                    hidden_states = torch.cat(all_hidden_states, dim=1)  # [B, total_seq_len, hidden_dim]
+                else:
+                    # 后备方案
+                    total_seq_len = input_ids.shape[1] + max_new_tokens
+                    hidden_states = torch.zeros(
+                        batch_size, total_seq_len, hidden_dim, device=trainable_device, dtype=torch.bfloat16
+                    )
+
+                # 创建对应的注意力掩码
+                total_seq_len = hidden_states.shape[1]
+                generation_attention_mask = torch.ones(
+                    batch_size, total_seq_len, device=trainable_device, dtype=torch.bool
+                )
+
+                return hidden_states, generation_attention_mask
+
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    overwatch.error(f"GPU内存不足: {e}")
+                    # 清理内存并重试
+                    torch.cuda.empty_cache()
+                    raise RuntimeError("GPU内存不足，请减少batch_size或max_new_tokens")
+                else:
+                    raise e
 
     def forward(
         self,
@@ -242,39 +313,58 @@ class CogACT(nn.Module):
     ) -> Tuple:
         """通过VLM运行前向传播，返回CausalLMOutputWithPast实例（包含损失）"""
 
-        # 从Qwen提取隐状态
-        hidden_states, generation_attention_mask = self.extract_qwen_hidden_states(
-            pixel_values=pixel_values, input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=max_new_tokens
-        )
+        # 内存优化：在前向传播前清理缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        # 使用交叉注意力生成认知特征
-        cognition_features = self.cross_attention(hidden_states, generation_attention_mask)  # [B, 1, hidden_dim]
+        try:
+            # 从Qwen提取隐状态
+            hidden_states, generation_attention_mask = self.extract_qwen_hidden_states(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+            )
 
-        # 投影到所需维度
-        cognition_features = self.cognition_projector(cognition_features)  # [B, 1, token_size]
+            # 使用交叉注意力生成认知特征
+            cognition_features = self.cross_attention(hidden_states, generation_attention_mask)  # [B, 1, hidden_dim]
 
-        # 处理动作数据
-        actions_history = actions[:, 0 : self.past_action_window_size, :]
-        actions_future = actions[:, -(self.future_action_window_size + 1) :, :]
+            # 投影到所需维度
+            cognition_features = self.cognition_projector(cognition_features)  # [B, 1, token_size]
 
-        # 重复动作数据用于扩散步骤
-        actions_repeated = actions_future.repeat(repeated_diffusion_steps, 1, 1)
-        actions_history_repeated = actions_history.repeat(repeated_diffusion_steps, 1, 1)
-        cognition_features_repeated = cognition_features.repeat(repeated_diffusion_steps, 1, 1)
+            # 确保actions在正确的设备上
+            actions = actions.to(self.device)
 
-        # 动作模型前向传播并计算损失
-        loss = self.action_model.loss(actions_repeated, cognition_features_repeated)
+            # 处理动作数据
+            actions_history = actions[:, 0 : self.past_action_window_size, :]
+            actions_future = actions[:, -(self.future_action_window_size + 1) :, :]
 
-        # 创建兼容的输出对象
-        output = CausalLMOutputWithPast(
-            loss=None,
-            logits=None,
-            past_key_values=None,
-            hidden_states=(hidden_states,) if output_hidden_states else None,
-            attentions=None,
-        )
+            # 重复动作数据用于扩散步骤
+            actions_repeated = actions_future.repeat(repeated_diffusion_steps, 1, 1)
+            actions_history_repeated = actions_history.repeat(repeated_diffusion_steps, 1, 1)
+            cognition_features_repeated = cognition_features.repeat(repeated_diffusion_steps, 1, 1)
 
-        return loss, output
+            # 动作模型前向传播并计算损失
+            loss = self.action_model.loss(actions_repeated, cognition_features_repeated)
+
+            # 创建兼容的输出对象
+            output = CausalLMOutputWithPast(
+                loss=None,
+                logits=None,
+                past_key_values=None,
+                hidden_states=(hidden_states,) if output_hidden_states else None,
+                attentions=None,
+            )
+
+            return loss, output
+
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                overwatch.error(f"前向传播内存不足: {e}")
+                torch.cuda.empty_cache()
+                raise
+            else:
+                raise
 
     def get_fsdp_wrapping_policy(self) -> Callable:
         """返回FSDP包装策略，仅包装可训练模块"""
@@ -315,21 +405,28 @@ class CogACT(nn.Module):
         action_model_type: str = "DiT-B",
         use_ema: bool = False,
         norm_stats=None,
+        # 新增设备管理参数
+        qwen_device_map: Union[str, Dict] = "auto",
+        trainable_device: int = 0,
+        max_memory_per_gpu: str = "22GB",
         **kwargs,
-    ) -> CogACT:
+    ) -> VLMCogACT:
         """从预训练检查点加载CogACT模型"""
 
-        # 初始化CogACT模型
-        cogact = CogACT(
+        # 初始化CogACT模型，传递设备管理参数
+        cogact = VLMCogACT(
             qwen_model_path=qwen_model_path,
-            token_size=4096,  # 可以根据需要调整
+            token_size=4096,
             action_dim=action_dim,
             future_action_window_size=future_action_window_size,
             past_action_window_size=past_action_window_size,
             action_model_type=action_model_type,
             use_ema=use_ema,
             norm_stats=norm_stats,
-            **kwargs,  # 传递额外参数
+            qwen_device_map=qwen_device_map,
+            trainable_device=trainable_device,
+            max_memory_per_gpu=max_memory_per_gpu,
+            **kwargs,
         )
 
         # 从检查点加载权重

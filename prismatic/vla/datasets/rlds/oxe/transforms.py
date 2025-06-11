@@ -901,4 +901,5 @@ OXE_STANDARDIZATION_TRANSFORMS = {
     "droid_wipe": droid_finetuning_transform,
     ### custom Finetuning datasets
     "custom_finetuning": identity_transform,
+    "libero_spatial_no_noops": identity_transform,
 }

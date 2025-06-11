@@ -16,8 +16,11 @@
             "type": "debugpy",
             "request": "launch",
             // 修改 program 为 torchrun
-            "program": "/ssdwork/liujinxin/miniconda3/envs/cogact/bin/torchrun",
+            "program": "/ssdwork/liujinxin/miniconda3/envs/cogact_mjf/bin/torchrun",
             "cwd": "${workspaceFolder}",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0" // 替换为你想指定的 GPU 编号
+            },
             // 修改 args 以包含 torchrun 的参数和原有的训练脚本参数
             "args": [
                 "--standalone",

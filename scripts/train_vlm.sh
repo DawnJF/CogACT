@@ -21,8 +21,8 @@ export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 # 训练配置
 WORLD_SIZE=6
 MASTER_PORT=29500
-BATCH_SIZE=4  # 每张卡的batch size
-GLOBAL_BATCH_SIZE=24  # 6 * 4
+BATCH_SIZE=4         # 每张卡的batch size
+GLOBAL_BATCH_SIZE=24 # 6 * 4
 ACCUMULATE_GRAD=1
 LEARNING_RATE=1e-4
 EPOCHS=10
@@ -45,7 +45,7 @@ VLA_TYPE="EXP_COGACT_OXE_MAGIC_SOUP_PLUS_MINUS"
 
 # Wandb配置
 WANDB_PROJECT="cogact-vla-training"
-WANDB_ENTITY="your_wandb_entity"  # 替换为你的wandb实体名
+WANDB_ENTITY="your_wandb_entity" # 替换为你的wandb实体名
 
 # 运行标识
 RUN_ID="cogact-vlm-6xa100-bs${BATCH_SIZE}-lr${LEARNING_RATE}-$(date +%Y%m%d_%H%M%S)"
@@ -99,7 +99,6 @@ torchrun \
     --future_action_window_size 15 \
     --past_action_window_size 0 \
     --action_model_type ${ACTION_MODEL_TYPE} \
-    --use_ema false \
     --action_dim 7 \
     --model_sharding true \
     --qwen_device_map auto \
@@ -108,8 +107,6 @@ torchrun \
     --offload_optimizer false \
     --max_memory_per_gpu 70GB \
     --accumulate_grad_batches ${ACCUMULATE_GRAD} \
-    --compile_model false \
-    --image_aug false \
     --vla.expected_world_size ${WORLD_SIZE} \
     --vla.global_batch_size ${GLOBAL_BATCH_SIZE} \
     --vla.per_device_batch_size ${BATCH_SIZE} \

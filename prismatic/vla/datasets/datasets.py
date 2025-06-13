@@ -38,7 +38,7 @@ class RLDSBatchTransform:
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
         dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"][0]
-        
+
         # For future action predictions
         if rlds_batch["action"].shape[0] > 1:
             dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"]
@@ -84,7 +84,7 @@ class RLDSBatchTransform:
                 action_mask = torch.tensor(rlds_batch["action_mask"], dtype=torch.bool)
 
         if self.action_tokenizer is None:
-            labels[: -1] = IGNORE_INDEX
+            labels[:-1] = IGNORE_INDEX
         else:
             # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
             labels[: -(len(action) + 1)] = IGNORE_INDEX
@@ -92,7 +92,75 @@ class RLDSBatchTransform:
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=action, action_masks=action_mask)
+        return dict(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            labels=labels,
+            dataset_name=dataset_name,
+            actions=action,
+            action_masks=action_mask,
+        )
+
+
+@dataclass
+class QwenVLRLDSBatchTransform:
+    action_tokenizer: ActionTokenizer
+    base_tokenizer: PreTrainedTokenizerBase
+    image_transform: ImageTransform
+    prompt_builder_fn: Type[PromptBuilder]
+    predict_stop_token: bool = True
+
+    def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
+        """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
+        dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"][0]
+
+        # For future action predictions
+        if rlds_batch["action"].shape[0] > 1:
+            dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"]
+        else:
+            dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"][0]
+
+        # img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+        img = rlds_batch["observation"]["image_primary"][0]
+        lang = rlds_batch["task"]["language_instruction"].decode().lower()
+
+        result = self.image_transform(img, lang=lang)
+        input_ids = result["input_ids"][0]
+        pixel_values = result["pixel_values"]
+        image_grid_thw = result["image_grid_thw"][0]
+        attention_mask = result["attention_mask"][0]
+
+        # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
+        #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
+        # input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
+
+        # Add future actions to batch
+        if rlds_batch["action"].shape[0] > 1:
+            action = torch.tensor(action, dtype=torch.float32)
+            action_mask = None
+            if "action_mask" in rlds_batch:
+                action_mask = torch.tensor(rlds_batch["action_mask"], dtype=torch.bool)
+
+        labels = input_ids
+        # if self.action_tokenizer is None:
+        #     labels[: -1] = IGNORE_INDEX
+        # else:
+        #     # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
+        #     labels[: -(len(action) + 1)] = IGNORE_INDEX
+
+        # if not self.predict_stop_token:
+        #     labels[-1] = IGNORE_INDEX
+
+        return dict(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            dataset_name=dataset_name,
+            actions=action,
+            action_masks=action_mask,
+            image_grid_thw=image_grid_thw,
+            attention_mask=attention_mask,
+            labels=labels,
+        )
 
 
 class RLDSDataset(IterableDataset):

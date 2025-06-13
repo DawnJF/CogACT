@@ -15,7 +15,7 @@ from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
-from prismatic.vla.datasets import EpisodicRLDSDataset, RLDSBatchTransform, RLDSDataset
+from prismatic.vla.datasets import EpisodicRLDSDataset, RLDSBatchTransform, RLDSDataset, QwenVLRLDSBatchTransform
 
 
 def get_vla_dataset_and_collator(
@@ -32,9 +32,9 @@ def get_vla_dataset_and_collator(
     episodic: bool = False,
     image_aug: bool = False,
     future_action_window_size: int = 0,
-    past_action_window_size: int = 1,         # Concatenated `past_action_window_size-1' actions and the current action for the input
+    past_action_window_size: int = 1,  # Concatenated `past_action_window_size-1' actions and the current action for the input
     load_all_data_for_training: bool = True,  # Load all data for training, or only a subset
-    base_action_tokenizer: PreTrainedTokenizerBase = None
+    base_action_tokenizer: PreTrainedTokenizerBase = None,
 ) -> Tuple[Dataset, ActionTokenizer, PaddedCollatorForActionPrediction]:
     """Initialize RLDS Dataset (wraps TFDS), ActionTokenizer, and initialize transform/collation functions."""
     if base_action_tokenizer is None:
@@ -42,7 +42,12 @@ def get_vla_dataset_and_collator(
     else:
         action_tokenizer = ActionTokenizer(base_action_tokenizer)
     # action_tokenizer = ActionTokenizer(tokenizer)
-    batch_transform = RLDSBatchTransform(
+    # batch_transform = RLDSBatchTransform(
+    #     action_tokenizer, tokenizer, image_transform, prompt_builder_fn, predict_stop_token=predict_stop_token
+    # )
+
+    # for CogVLA
+    batch_transform = QwenVLRLDSBatchTransform(
         action_tokenizer, tokenizer, image_transform, prompt_builder_fn, predict_stop_token=predict_stop_token
     )
     collator = PaddedCollatorForActionPrediction(

@@ -137,6 +137,11 @@ class PaddedCollatorForActionPrediction:
         action_masks = [instance["action_masks"] for instance in instances]
         action_masks = torch.stack(action_masks)
 
+        image_grid_thws = None
+        if "image_grid_thw" in instances[0]:
+            image_grid_thws = [instance["image_grid_thw"] for instance in instances]
+            image_grid_thw = torch.stack(image_grid_thws)
+
         output = dict(
             pixel_values=pixel_values,
             input_ids=input_ids,
@@ -147,4 +152,6 @@ class PaddedCollatorForActionPrediction:
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+        if image_grid_thws is not None:
+            output["image_grid_thw"] = image_grid_thw
         return output

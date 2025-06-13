@@ -25,7 +25,7 @@ from prismatic.vla import get_vla_dataset_and_collator
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 
 from training import VLAMetrics
-from training.strategies.ddp_light import DDPLightStrategy
+from training.strategies.trainer_strategy import TrainerStrategy
 from conf import VLAConfig, VLARegistry
 from vla import load, load_vla, init_vla
 from vla.cogvla import VLMCogACT
@@ -93,9 +93,6 @@ class TrainConfig:
     offload_optimizer: bool = False  # 是否卸载优化器状态到CPU
     max_memory_per_gpu: str = "70GB"  # A100 80GB，保留10GB
     
-    # 训练优化配置
-    accumulate_grad_batches: int = 1  # 梯度累积步数
-    compile_model: bool = False  # 是否使用torch.compile (需要PyTorch 2.0+)
 
     def __post_init__(self) -> None:
         """A100优化的初始化配置"""
@@ -117,8 +114,6 @@ class TrainConfig:
             self.vla.expected_world_size == overwatch.world_size()
         ), f"Expected World Size = {self.vla.expected_world_size} but Found {overwatch.world_size()} GPUs!"
 
-        # 计算有效批次大小，考虑梯度累积
-        self.effective_batch_size = self.global_batch_size * self.accumulate_grad_batches
         
         # 根据GPU数量调整设备映射策略
         if self.model_sharding and overwatch.world_size() >= 6:
@@ -150,24 +145,11 @@ class TrainConfig:
 
 @draccus.wrap()
 def train(cfg: TrainConfig) -> None:
-    overwatch.info("CogACT-VLA Training :: A100优化训练")
+    overwatch.info("CogACT-VLA Training")
 
     # Note => Under `torchrun` initializing `overwatch` will automatically set up `torch.distributed`
     torch.cuda.set_device(device_id := overwatch.local_rank())
     torch.cuda.empty_cache()
-
-    # A100专用配置
-    if cfg.gradient_checkpointing:
-        torch.backends.cudnn.benchmark = True  # A100性能优化
-        torch.backends.cudnn.deterministic = False
-
-    # 打印A100信息
-    for i in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(i)
-        if "A100" in props.name:
-            overwatch.info(f"GPU {i}: {props.name}, Memory: {props.total_memory / 1024**3:.1f}GB")
-        else:
-            overwatch.warning(f"GPU {i}: {props.name} - 非A100 GPU，性能可能不佳")
 
     # Configure Unique Run Name & Save Directory
     vla_id = cfg.vla.vla_id
@@ -206,6 +188,7 @@ def train(cfg: TrainConfig) -> None:
     if cfg.cogact_pretrained_checkpoint is not None:
         vla = init_vla(
             cfg.cogact_pretrained_checkpoint,
+            cfg.qwen_model_path,
             hf_token=hf_token,
             load_for_training=True,
             action_model_type=cfg.action_model_type,
@@ -227,35 +210,11 @@ def train(cfg: TrainConfig) -> None:
             past_action_window_size=cfg.past_action_window_size,
             use_ema=cfg.use_ema,
             cross_attn_heads=cfg.cross_attn_heads,
-            # A100优化参数
-            qwen_device_map=cfg.qwen_device_map,
             trainable_device=cfg.trainable_device,
-            max_memory_per_gpu=cfg.max_memory_per_gpu,
         )
 
-    # 启用梯度检查点（如果配置）
-    if cfg.gradient_checkpointing:
-        if hasattr(vla, "enable_gradient_checkpointing"):
-            vla.enable_gradient_checkpointing()
-
-    # A100优化的编译
-    if cfg.compile_model and hasattr(torch, "compile"):
-        overwatch.info("A100优化编译可训练模块")
-        vla.cross_attention = torch.compile(
-            vla.cross_attention, 
-            mode="max-autotune",  # A100最大优化
-            fullgraph=True
-        )
-        vla.action_model = torch.compile(
-            vla.action_model, 
-            mode="max-autotune",
-            fullgraph=True
-        )
-
-    # [Validate] Model should be in Full Precision for trainable parts!
-    for name, param in vla.named_parameters():
-        if param.requires_grad:
-            assert param.dtype == torch.float32, f"Trainable parameter {name} not in full precision: {param.dtype}"
+    vla.freeze_qwen()
+    vla.freeze_action_model()
 
     # Print number of total/trainable model parameters
     num_params = sum(p.numel() for p in vla.parameters())
@@ -276,10 +235,10 @@ def train(cfg: TrainConfig) -> None:
     vla_dataset, _, collator = get_vla_dataset_and_collator(
         cfg.data_root_dir,
         cfg.vla.data_mix,
-        image_transform=vla.vision_backbone.get_image_transform(),
-        tokenizer=vla.llm_backbone.get_tokenizer(),
-        prompt_builder_fn=vla.llm_backbone.prompt_builder_fn,
-        default_image_resolution=vla.vision_backbone.default_image_resolution,
+        image_transform=vla.get_image_transform(),
+        tokenizer=vla.get_tokenizer(),
+        prompt_builder_fn=vla.prompt_builder_fn,
+        default_image_resolution=vla.default_image_resolution,
         shuffle_buffer_size=cfg.vla.shuffle_buffer_size,
         image_aug=cfg.image_aug,
         load_all_data_for_training=cfg.load_all_data_for_training,
@@ -293,28 +252,25 @@ def train(cfg: TrainConfig) -> None:
 
     dist.barrier()
     # 创建训练策略
-    if cfg.use_vlm_cogact:
-        overwatch.info("A100优化的VLMCogACT ddp-light训练策略")
-        train_strategy = DDPLightStrategy(
-            vlm=vla,
-            device_id=device_id,
-            stage="",
-            epochs=cfg.epochs,
-            max_steps=cfg.max_steps,
-            global_batch_size=cfg.global_batch_size,
-            per_device_batch_size=cfg.per_device_batch_size,
-            learning_rate=cfg.learning_rate,
-            weight_decay=cfg.weight_decay,
-            max_grad_norm=cfg.max_grad_norm,
-            lr_scheduler_type=cfg.lr_scheduler_type,
-            warmup_ratio=cfg.warmup_ratio,
-            worker_init_fn=worker_init_fn,
-            # A100优化参数
-            accumulate_grad_batches=cfg.accumulate_grad_batches,
-            offload_optimizer=cfg.offload_optimizer,
-        )
 
-    train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(vla_dataset))
+    overwatch.info("ddp-light训练策略")
+    train_strategy = TrainerStrategy(
+        vla,
+        device_id,
+        epochs=cfg.epochs,
+        max_steps=cfg.max_steps,
+        global_batch_size=cfg.global_batch_size,
+        per_device_batch_size=cfg.per_device_batch_size,
+        learning_rate=cfg.learning_rate,
+        weight_decay=cfg.weight_decay,
+        max_grad_norm=cfg.max_grad_norm,
+        lr_scheduler_type=cfg.lr_scheduler_type,
+        warmup_ratio=cfg.warmup_ratio,
+        worker_init_fn=worker_init_fn,
+        offload_optimizer=cfg.offload_optimizer,
+    )
+
+    # train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(vla_dataset))
 
     # Create Metrics =>> Handles on the fly tracking, logging to specified trackers (e.g., JSONL, Weights & Biases)
     overwatch.info(f"Creating Metrics with Active Trackers => `{cfg.trackers}`")
@@ -330,11 +286,12 @@ def train(cfg: TrainConfig) -> None:
     # Run VLA Training
     overwatch.info("Starting VLA Training Loop")
     train_strategy.run_vla_training(
+        run_dir,
         vla_dataset,
         collator,
         metrics,
         save_interval=cfg.save_interval,
-        action_model=True,
+        save_full_model=True,  # Always save full model for CogACT
     )
 
     # Finalize

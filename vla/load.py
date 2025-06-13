@@ -221,6 +221,7 @@ def load_vla(
 
 def init_vla(
     model_id_or_path: Union[str, Path],
+    qwen_model_path,
     **kwargs,
 ) -> VLMCogACT:
 
@@ -241,9 +242,10 @@ def init_vla(
 
     vla = VLMCogACT.from_pretrained(
         checkpoint_pt,
-        qwen_model_path="",
+        qwen_model_path=qwen_model_path,
         norm_stats=norm_stats,
         **kwargs,
     )
+    vla.to(dtype=vla.qwen_model.dtype)
 
     return vla

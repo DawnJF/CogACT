@@ -124,7 +124,9 @@ class QwenVLRLDSBatchTransform:
         img = rlds_batch["observation"]["image_primary"][0]
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
 
-        result = self.image_transform(img, lang=lang)
+        state = rlds_batch['observation']['proprio']
+
+        result = self.image_transform(img, lang=lang,state=state)
         input_ids = result["input_ids"][0]
         pixel_values = result["pixel_values"]
         image_grid_thw = result["image_grid_thw"][0]
@@ -141,6 +143,7 @@ class QwenVLRLDSBatchTransform:
             if "action_mask" in rlds_batch:
                 action_mask = torch.tensor(rlds_batch["action_mask"], dtype=torch.bool)
 
+        state = torch.tensor(state[0], dtype=torch.float32)
         labels = input_ids
         # if self.action_tokenizer is None:
         #     labels[: -1] = IGNORE_INDEX
@@ -160,6 +163,7 @@ class QwenVLRLDSBatchTransform:
             image_grid_thw=image_grid_thw,
             attention_mask=attention_mask,
             labels=labels,
+            state=state,
         )
 
 
@@ -193,7 +197,7 @@ class RLDSDataset(IterableDataset):
             mixture_spec,
             load_camera_views=("primary",),
             load_depth=False,
-            load_proprio=False,
+            load_proprio=True,
             load_language=True,
             action_proprio_normalization_type=NormalizationType.BOUNDS_Q99,
         )

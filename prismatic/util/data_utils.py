@@ -97,6 +97,7 @@ class PaddedCollatorForActionPrediction:
     pad_token_id: int
     padding_side: str = "right"
     pixel_values_dtype: torch.dtype = torch.float32
+    GLOBAL_MAX_SEQUENCE_LENGTH: int = 4096  # Global max sequence length for all datasets
 
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
@@ -109,11 +110,30 @@ class PaddedCollatorForActionPrediction:
         # For now, we only support Tokenizers with `padding_side = "right"` during training
         #   => Handle padding via RNN Utils => `pad_sequence`
         assert self.padding_side == "right", f"Invalid Tokenizer `{self.padding_side = }`"
+
+        # Use GLOBAL_MAX_SEQUENCE_LENGTH for padding instead of dynamic padding
         input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.pad_token_id)
         labels = pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
 
-        # Truncate (if necessary)
-        input_ids, labels = input_ids[:, : self.model_max_length], labels[:, : self.model_max_length]
+        # Pad to GLOBAL_MAX_SEQUENCE_LENGTH
+        batch_size = input_ids.size(0)
+        current_length = input_ids.size(1)
+
+        if current_length < self.GLOBAL_MAX_SEQUENCE_LENGTH:
+            # Pad to GLOBAL_MAX_SEQUENCE_LENGTH
+            pad_length = self.GLOBAL_MAX_SEQUENCE_LENGTH - current_length
+            input_ids = torch.cat(
+                [input_ids, torch.full((batch_size, pad_length), self.pad_token_id, dtype=input_ids.dtype)], dim=1
+            )
+            labels = torch.cat([labels, torch.full((batch_size, pad_length), IGNORE_INDEX, dtype=labels.dtype)], dim=1)
+        elif current_length > self.GLOBAL_MAX_SEQUENCE_LENGTH:
+            print(
+                f"Warning: Input sequence length {current_length} exceeds GLOBAL_MAX_SEQUENCE_LENGTH "
+                f"{self.GLOBAL_MAX_SEQUENCE_LENGTH}"
+            )
+            # Truncate to GLOBAL_MAX_SEQUENCE_LENGTH
+            input_ids = input_ids[:, : self.GLOBAL_MAX_SEQUENCE_LENGTH]
+            labels = labels[:, : self.GLOBAL_MAX_SEQUENCE_LENGTH]
 
         # Get `attention_mask` by checking for `pad_token_id`
         attention_mask = input_ids.ne(self.pad_token_id)
@@ -142,6 +162,11 @@ class PaddedCollatorForActionPrediction:
             image_grid_thws = [instance["image_grid_thw"] for instance in instances]
             image_grid_thw = torch.stack(image_grid_thws)
 
+        states = None
+        if "state" in instances[0]:
+            states = [instance["state"] for instance in instances]
+            states = torch.stack(states)
+
         output = dict(
             pixel_values=pixel_values,
             input_ids=input_ids,
@@ -150,8 +175,10 @@ class PaddedCollatorForActionPrediction:
             actions=actions,
             action_masks=action_masks,
         )
-        if dataset_names is not None:
-            output["dataset_names"] = dataset_names
+        # if dataset_names is not None:
+        #     output["dataset_names"] = dataset_names
         if image_grid_thws is not None:
             output["image_grid_thw"] = image_grid_thw
+        if states is not None:
+            output["state"] = states
         return output

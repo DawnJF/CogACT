@@ -12,7 +12,7 @@ from functools import partial
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Type, Union, Tuple
 from copy import deepcopy
-
+from transformers import PreTrainedModel, PretrainedConfig
 import torch
 import torch.nn as nn
 import numpy as np
@@ -22,14 +22,65 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, AutoProcessor
 from action_model.action_model import ActionModel
 from action_model.models import DiT
-
-# 添加缺失的logging导入
+from deepspeed.runtime.zero import Init
 import logging
 
 overwatch = logging.getLogger(__name__)
 
 # HuggingFace默认 / LLaMa-2 IGNORE_INDEX (用于标签)
 IGNORE_INDEX = -100
+
+
+def get_promot(version, task, state):
+    """获取任务提示"""
+    if version == "v1":
+        return (
+            f"为了完成任务'{task}'，机械臂应该朝哪个方向移动？请用【方位角（0°-360°）】和【俯仰角（-90° 到 90°）】来回答"
+        )
+    elif version == "v2":
+        return f"你需要控制机械臂末端运动来完成任务：{task}。请详细说明接下来2s的运动细节，包括方向和轨迹，回答要求直接简洁明了。"
+    elif version == "v3":
+        return f"任务'{task}'要求机械臂朝哪个方向移动？请用三维单位向量 (x, y, z) 表示目标方向。"
+    elif version == "v4":
+        return f"为了完成任务'{task}'，机械臂应朝哪个方向运动？请用 ‘几点钟方向’ + ‘上下角度’ 的方式表达。"
+    elif version == "v5":
+        return f"为了完成任务'{task}'，机械臂应向哪个方向移动？请用自然语言表达（如：右前上、左下、正上方等）"
+    elif version == "v6":
+        return f"为了完成任务'{task},'要求机械臂调整姿态，请给出期望的【Yaw（航向）】、【Pitch（俯仰）】、【Roll（横滚）】角度"
+    elif version == "v7":
+        return f"为完成任务'{task}'，机械臂的目标方向请用球坐标系 (θ 倾角, φ 方位角) 表达。"
+    elif version == "v8":
+        return f"""
+You are given an image containing a robotic arm with a gripper and several objects. The task is to detect and return the 2D bounding boxes of the robotic arm's gripper and all relevant objects involved in the following instruction: 
+\n
+{task}"
+\n
+Please analyze the image and output a list of JSON-formatted objects, each representing a detected item. Each object should contain: \n
+- "bbox_2d": a list of four integers [x1, y1, x2, y2], where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner of the bounding box. \n
+- "label": the label of the object. \n
+
+The labels to identify are - gripper (the end-effector of the robotic arm) and the objects from the above instruction.
+"""
+    elif version == "v9":
+        return f"""
+You are given an image containing a robotic arm with a gripper and several objects. The task is to complete the following instruction:
+
+"{task}"
+
+The current state of the robotic arm is:
+"{state}"
+
+Please perform the following steps:
+1. Detect and return the 2D bounding boxes of the robotic arm's gripper and all relevant objects involved in the task. Each object should be represented as a JSON-formatted item, containing:
+   - "bbox_2d": a list of four integers [x1, y1, x2, y2], where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner of the bounding box.
+   - "label": the label of the object.
+
+   The labels to identify are: - gripper (the end-effector of the robotic arm) and the objects from the above instruction.
+
+2. Based on the detected bounding boxes and the task instruction, infer the sequence of movements that the gripper should follow to complete the task. Specifically, indicate in order which object's bounding box the gripper should move toward, and why. The output json should contain:
+ - "target_label": the label of objects from the above instruction
+ - "reason": explain why move to the target label and what should the gripper do.
+"""
 
 
 class CrossAttention(nn.Module):
@@ -70,51 +121,102 @@ class CrossAttention(nn.Module):
         return cognition_features
 
 
-class VLMCogACT(nn.Module):
+class Projector(nn.Module):
+    """投影层，将Qwen的输出维度投影到指定的token_size"""
+
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__()
+
+        modules = [nn.Linear(input_dim, input_dim)]
+        for _ in range(1, 2):
+            modules.append(nn.GELU())
+            modules.append(nn.Linear(input_dim, input_dim))
+        modules.append(nn.Linear(input_dim, output_dim))
+        self.projector = nn.Sequential(*modules)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, seq_len, input_dim] 输入张量
+        Returns:
+            projected_x: [B, seq_len, output_dim] 投影后的张量
+        """
+        return self.projector(x)
+
+
+class VLMCogACTConfig(PretrainedConfig):
+    model_type = "vlm_cogact"
+
     def __init__(
         self,
-        qwen_model_path: str = "Qwen/Qwen2.5-VL-72B-Instruct",
-        action_model_type: str = "DiT-B",
-        token_size: int = 4096,
-        action_dim: int = 7,
-        future_action_window_size: int = 15,
-        past_action_window_size: int = 0,
-        use_ema: bool = False,
-        norm_stats: Dict[str, Dict[str, Dict[str, Dict[str, List[float]]]]] = None,
-        cross_attn_heads: int = 8,
+        norm_stats,
+        qwen_model_path="Qwen/Qwen2.5-VL-72B-Instruct",
+        action_model_type="DiT-B",
+        token_size=4096,
+        action_dim=7,
+        future_action_window_size=15,
+        past_action_window_size=0,
+        use_ema=False,
+        cross_attn_heads=8,
         **kwargs,
-    ) -> None:
-        super().__init__()
+    ):
+        super().__init__(**kwargs)
+        self.norm_stats = norm_stats
+        self.qwen_model_path = qwen_model_path
+        self.action_model_type = action_model_type
+        self.token_size = token_size
+        self.action_dim = action_dim
+        self.future_action_window_size = future_action_window_size
+        self.past_action_window_size = past_action_window_size
+        self.use_ema = use_ema
+        self.cross_attn_heads = cross_attn_heads
+        self.hidden_size = 8192  # Qwen2.5-VL-72B的隐藏维度
+        self.promot_v = kwargs["prompt_v"]
+        overwatch.info(f"VLMCogACTConfig initialized with promot_v={self.promot_v}")
+
+
+class VLMCogACT(PreTrainedModel):
+    config_class = VLMCogACTConfig
+
+    def __init__(self, config: VLMCogACTConfig):
+        super().__init__(config)
+        self.config = config  # 保证可以访问 self.config.hidden_size 等属性
+
+        # 原来构造模块的代码放到下面：
+        qwen_model_path = config.qwen_model_path
+        action_model_type = config.action_model_type
+        token_size = config.token_size
+        action_dim = config.action_dim
+        future_action_window_size = config.future_action_window_size
+        past_action_window_size = config.past_action_window_size
+        use_ema = config.use_ema
+        cross_attn_heads = config.cross_attn_heads
+        norm_stats = config.norm_stats
 
         # 初始化Qwen2.5-VL-72B模型，使用优化的设备映射
         overwatch.info(f"加载Qwen模型: {qwen_model_path}")
 
-        try:
-            self.qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                qwen_model_path,
-                torch_dtype="auto",
-            )
+        # 修改后：使用Zero-3的meta初始化
+        # with Init(remote_device="cpu", pin_memory=True):
+        self.qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            qwen_model_path,
+            torch_dtype="auto",
+        )
 
-            self.qwen_processor = AutoProcessor.from_pretrained(qwen_model_path)
-            self.tokenizer = AutoTokenizer.from_pretrained(qwen_model_path)
+        self.qwen_processor = AutoProcessor.from_pretrained(qwen_model_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(qwen_model_path)
 
-            overwatch.info("Qwen模型加载成功")
-
-        except Exception as e:
-            overwatch.error(f"Qwen模型加载失败: {e}")
-            raise
+        overwatch.info("Qwen模型加载成功")
 
         # 获取Qwen的隐藏维度
         qwen_hidden_dim = self.qwen_model.config.hidden_size
 
-        # 交叉注意力模块用于生成认知特征 - 放在指定的可训练设备上
+        # 交叉注意力模块用于生成认知特征
+        overwatch.info(f"初始化交叉注意力模块，隐藏维度: {qwen_hidden_dim}, 注意力头数: {cross_attn_heads}")
         self.cross_attention = CrossAttention(qwen_hidden_dim, cross_attn_heads)
 
         # 如果token_size与qwen_hidden_dim不匹配，添加投影层
-        if token_size != qwen_hidden_dim:
-            self.cognition_projector = nn.Linear(qwen_hidden_dim, token_size)
-        else:
-            self.cognition_projector = nn.Identity()
+        self.cognition_projector = Projector(qwen_hidden_dim + 8, token_size)
 
         # 动作模型 - 也放在可训练设备上
         self.action_model = ActionModel(
@@ -129,17 +231,12 @@ class VLMCogACT(nn.Module):
         self.past_action_window_size = past_action_window_size
         # self.use_ema = use_ema
 
-        self.all_module_keys = ["action_model", "cross_attention", "cognition_projector"]
-
         # 可训练模块键
-        self._trainable_module_keys = ["action_model", "cross_attention", "cognition_projector"]
+        self._trainable_module_keys = ["cross_attention", "cognition_projector"]
         self.norm_stats = norm_stats
 
         # 设置默认图像分辨率 (Qwen2.5-VL通常使用448x448)
         self._default_image_resolution = (3, 448, 448)  # TODO
-
-        # 记录内存使用情况
-        self._log_model_memory_usage()
 
     def freeze_qwen(self):
         # 完全冻结Qwen参数
@@ -150,15 +247,6 @@ class VLMCogACT(nn.Module):
         """冻结动作模型的参数"""
         self.action_model.requires_grad_(False)
         self.action_model.eval()
-
-    def _log_model_memory_usage(self):
-        """记录模型内存使用情况"""
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                allocated = torch.cuda.memory_allocated(i) / 1024**3
-                reserved = torch.cuda.memory_reserved(i) / 1024**3
-                if allocated > 0 or reserved > 0:
-                    overwatch.info(f"GPU {i} 内存使用: 已分配 {allocated:.2f}GB, 已保留 {reserved:.2f}GB")
 
     @property
     def trainable_module_keys(self) -> List[str]:
@@ -176,7 +264,7 @@ class VLMCogACT(nn.Module):
         input_ids: torch.Tensor,
         attention_mask,
         image_grid_thw,
-        max_new_tokens: int = 100,
+        max_new_tokens: int = 2048,
     ):
         """
         从Qwen模型中提取自回归生成的隐状态
@@ -202,18 +290,20 @@ class VLMCogACT(nn.Module):
             # 方法一：所有Token的最后一层hidden_states（包括输入和生成）(B, total_seq_len, hidden_dim)
             all_last_layer = torch.cat([hs[-1] for hs in outputs.hidden_states], dim=1)
             all_mask = (outputs.sequences != self.tokenizer.pad_token_id).long()  # (B, total_seq_len)
+            all_mask = all_mask[:, :-1]
 
             # 方法二：仅新生成Token的最后一层hidden_states (B, T, hidden_dim)
             new_tokens_last_layer = torch.stack([hs[-1][:, -1, :] for hs in outputs.hidden_states], dim=1)
             new_sequences = outputs.sequences[:, input_ids.shape[1] :]  # (B, T)
             new_mask = (new_sequences != self.tokenizer.pad_token_id).long()  # (B, T)
 
-            return new_tokens_last_layer, new_mask, outputs.sequences
+            return all_last_layer, all_mask, outputs.sequences
 
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        state: Optional[torch.FloatTensor] = None,
         pixel_values: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         image_grid_thw: Optional[torch.FloatTensor] = None,
@@ -243,8 +333,12 @@ class VLMCogACT(nn.Module):
         # 使用交叉注意力生成认知特征
         cognition_features = self.cross_attention(hidden_states, attention_mask)
 
+        # cat state and cognition_features
+        feature = torch.cat([cognition_features.squeeze(), state], -1)
+
         # 投影到所需维度
-        cognition_features = self.cognition_projector(cognition_features)  # [B, 1, token_size]
+        cognition_features = self.cognition_projector(feature)  # [B, token_size]
+        cognition_features = cognition_features.unsqueeze(1)  # [B, 1, token_size]
 
         # 处理动作数据
         actions_history = actions[:, 0 : self.past_action_window_size, :]
@@ -316,9 +410,8 @@ class VLMCogACT(nn.Module):
         """从预训练检查点加载CogACT模型"""
 
         # 初始化CogACT模型，传递设备管理参数
-        cogact = VLMCogACT(
+        config = VLMCogACTConfig(
             qwen_model_path=qwen_model_path,
-            token_size=4096,
             action_dim=action_dim,
             future_action_window_size=future_action_window_size,
             past_action_window_size=past_action_window_size,
@@ -329,6 +422,7 @@ class VLMCogACT(nn.Module):
             max_memory_per_gpu=max_memory_per_gpu,
             **kwargs,
         )
+        cogact = VLMCogACT(config)
 
         # 从检查点加载权重
         if pretrained_checkpoint and pretrained_checkpoint.exists():
@@ -662,7 +756,7 @@ class VLMCogACT(nn.Module):
         """获取图像预处理变换，使用Qwen自己的处理方式"""
 
         # return QwenImageTransform(self.qwen_processor, self.default_image_resolution)
-        return QwenInputTransform(self.qwen_processor)
+        return QwenInputTransform(self.qwen_processor, self.config.promot_v)
 
     def get_tokenizer(self):
         """返回Qwen模型的tokenizer"""
@@ -670,34 +764,7 @@ class VLMCogACT(nn.Module):
 
     @property
     def prompt_builder_fn(self):
-        """返回构建提示的函数"""
-
-        def build_prompt(conversations):
-            """为VLM构建提示的函数
-
-            Args:
-                conversations: 对话数据，可以是字符串或对话列表
-
-            Returns:
-                构建好的消息列表或处理后的文本
-            """
-            if isinstance(conversations, str):
-                # 简单字符串格式
-                return conversations
-            elif isinstance(conversations, list):
-                # 处理对话列表格式
-                messages = []
-                for conv in conversations:
-                    if isinstance(conv, dict):
-                        messages.append(conv)
-                    else:
-                        messages.append({"role": "user", "content": str(conv)})
-                return messages
-            else:
-                # 其他格式转为字符串
-                return str(conversations)
-
-        return build_prompt
+        return None
 
     @property
     def default_image_resolution(self):
@@ -708,10 +775,11 @@ class VLMCogACT(nn.Module):
 class QwenInputTransform:
     """Qwen输入转换器，用于将图像和文本转换为模型输入格式"""
 
-    def __init__(self, qwen_processor: AutoProcessor):
+    def __init__(self, qwen_processor: AutoProcessor, version):
         self.processor = qwen_processor
+        self.version = version
 
-    def __call__(self, image, lang) -> Dict[str, torch.Tensor]:
+    def __call__(self, image, lang, state) -> Dict[str, torch.Tensor]:
         """
         self.image_transform(img, lang=lang)
         """
@@ -720,14 +788,10 @@ class QwenInputTransform:
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "image",
-                    },
+                    {"type": "image"},
                     {
                         "type": "text",
-                        "text": (
-                            f"你要控制机械臂末端运动并完成任务，具体的任务是：'{lang}'，请详细说明接下来2s的运动细节，包括方向和轨迹，回答要求直接简洁明了。"
-                        ),
+                        "text": get_promot(self.version, lang, state),
                     },
                 ],
             }

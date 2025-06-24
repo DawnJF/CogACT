@@ -823,8 +823,10 @@ def tdroid_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     trajectory["observation"]["gripper_state"] = trajectory["observation"]["gripper_position"][:, -1:]
     return trajectory
 
+
 def identity_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     return trajectory
+
 
 # === Registry ===
 OXE_STANDARDIZATION_TRANSFORMS = {
@@ -902,4 +904,5 @@ OXE_STANDARDIZATION_TRANSFORMS = {
     ### custom Finetuning datasets
     "custom_finetuning": identity_transform,
     "libero_spatial_no_noops": identity_transform,
+    "libero_10_no_noops": identity_transform,
 }

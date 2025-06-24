@@ -149,7 +149,7 @@ class VLMCogACTConfig(PretrainedConfig):
 
     def __init__(
         self,
-        norm_stats,
+        norm_stats=None,
         qwen_model_path="Qwen/Qwen2.5-VL-72B-Instruct",
         action_model_type="DiT-B",
         token_size=4096,
@@ -171,7 +171,7 @@ class VLMCogACTConfig(PretrainedConfig):
         self.use_ema = use_ema
         self.cross_attn_heads = cross_attn_heads
         self.hidden_size = 8192  # Qwen2.5-VL-72B的隐藏维度
-        self.promot_v = kwargs["prompt_v"]
+        self.promot_v = kwargs.get("prompt_v", "v1")
         overwatch.info(f"VLMCogACTConfig initialized with promot_v={self.promot_v}")
 
 

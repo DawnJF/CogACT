@@ -62,6 +62,8 @@ class ActionModel(nn.Module):
         x_t = self.diffusion.q_sample(x, timestep, noise)
 
         # predict noise from x_t
+        # print(f"x_t: {x_t.dtype}")
+        x_t = x_t.to(x.dtype)
         noise_pred = self.net(x_t, timestep, z)
 
         assert noise_pred.shape == noise.shape == x.shape

@@ -57,7 +57,7 @@ class TrainConfig:
     # Run Arguments
     run_id: Optional[str] = None
     run_id_note: Optional[str] = None
-    save_interval: int = 2500
+    save_interval: int = 5000
     image_aug: bool = False
     seed: int = 42
 
@@ -92,6 +92,9 @@ class TrainConfig:
     gradient_checkpointing: bool = True  # 启用梯度检查点以节省内存
     offload_optimizer: bool = False  # 是否卸载优化器状态到CPU
     max_memory_per_gpu: str = "70GB"  # A100 80GB，保留10GB
+    prompt_v: str = "v1"
+
+    deepspeed: Optional[str] = None
     
 
     def __post_init__(self) -> None:
@@ -109,37 +112,6 @@ class TrainConfig:
 
         self.train_strategy = self.vla.train_strategy
 
-        # [Validate] Assert on `expected_world_size`
-        assert (
-            self.vla.expected_world_size == overwatch.world_size()
-        ), f"Expected World Size = {self.vla.expected_world_size} but Found {overwatch.world_size()} GPUs!"
-
-        
-        # 根据GPU数量调整设备映射策略
-        if self.model_sharding and overwatch.world_size() >= 6:
-            # 6-8张A100：智能分配Qwen模型到前几张卡，可训练模块到后几张卡
-            num_layers = 80  # Qwen2.5-72B层数
-            qwen_gpus = overwatch.world_size() - 2  # 前N-2张卡给Qwen
-            
-            self.qwen_device_map = {}
-            for i in range(num_layers):
-                gpu_id = i % qwen_gpus
-                self.qwen_device_map[f"model.layers.{i}"] = f"cuda:{gpu_id}"
-            
-            # 其他组件分配
-            self.qwen_device_map.update({
-                "model.embed_tokens": "cuda:0",
-                "model.norm": f"cuda:{qwen_gpus-1}",
-                "lm_head": f"cuda:{qwen_gpus-1}",
-            })
-            
-            # 可训练模块使用最后两张卡
-            self.trainable_device = overwatch.world_size() - 2
-        else:
-            # 少于6卡时使用自动设备映射
-            self.qwen_device_map = "auto"
-            self.trainable_device = 0
-
     # fmt: on
 
 
@@ -153,11 +125,7 @@ def train(cfg: TrainConfig) -> None:
 
     # Configure Unique Run Name & Save Directory
     vla_id = cfg.vla.vla_id
-    cfg.run_id = (
-        f"{vla_id}+n{cfg.vla.expected_world_size // 8}+b{cfg.per_device_batch_size}+x{cfg.seed}"
-        if cfg.run_id is None
-        else cfg.run_id
-    )
+    cfg.run_id = f"{vla_id}+b{cfg.per_device_batch_size}+x{cfg.seed}" if cfg.run_id is None else cfg.run_id
     if cfg.run_id_note is not None:
         cfg.run_id += f"--{cfg.run_id_note}"
     if cfg.image_aug:
@@ -196,21 +164,7 @@ def train(cfg: TrainConfig) -> None:
             future_action_window_size=cfg.future_action_window_size,
             past_action_window_size=cfg.past_action_window_size,
             use_ema=cfg.use_ema,
-        )
-    else:
-        # 直接创建新模型
-        from vla.cogvla import VLMCogACT
-
-        vla = VLMCogACT(
-            qwen_model_path=cfg.qwen_model_path,
-            action_model_type=cfg.action_model_type,
-            token_size=cfg.cognition_token_size,
-            action_dim=cfg.action_dim,
-            future_action_window_size=cfg.future_action_window_size,
-            past_action_window_size=cfg.past_action_window_size,
-            use_ema=cfg.use_ema,
-            cross_attn_heads=cfg.cross_attn_heads,
-            trainable_device=cfg.trainable_device,
+            prompt_v=cfg.prompt_v,
         )
 
     vla.freeze_qwen()
@@ -253,7 +207,7 @@ def train(cfg: TrainConfig) -> None:
     dist.barrier()
     # 创建训练策略
 
-    overwatch.info("ddp-light训练策略")
+    overwatch.info("TrainerStrategy")
     train_strategy = TrainerStrategy(
         vla,
         device_id,
@@ -266,7 +220,7 @@ def train(cfg: TrainConfig) -> None:
         max_grad_norm=cfg.max_grad_norm,
         lr_scheduler_type=cfg.lr_scheduler_type,
         warmup_ratio=cfg.warmup_ratio,
-        worker_init_fn=worker_init_fn,
+        deepspeed=cfg.deepspeed,
         offload_optimizer=cfg.offload_optimizer,
     )
 

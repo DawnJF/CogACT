@@ -641,7 +641,6 @@ OXE_DATASET_CONFIGS = {
         "state_encoding": StateEncoding.POS_EULER,
         "action_encoding": ActionEncoding.EEF_POS,
     },
-
     ### Custom Finetuning Datasets
     "custom_finetuning": {
         "image_obs_keys": {"primary": "image", "secondary": None, "wrist": None},
@@ -650,11 +649,16 @@ OXE_DATASET_CONFIGS = {
         "state_encoding": StateEncoding.POS_QUAT,
         "action_encoding": ActionEncoding.EEF_POS,
     },
-
-
     # step['observation'].keys()
     # dict_keys(['image', 'joint_state', 'state', 'wrist_image'])
     "libero_spatial_no_noops": {
+        "image_obs_keys": {"primary": "image", "secondary": None, "wrist": None},
+        "depth_obs_keys": {"primary": "depth", "secondary": None, "wrist": None},
+        "state_obs_keys": ["state"],
+        "state_encoding": StateEncoding.POS_QUAT,
+        "action_encoding": ActionEncoding.EEF_POS,
+    },
+    "libero_10_no_noops": {
         "image_obs_keys": {"primary": "image", "secondary": None, "wrist": None},
         "depth_obs_keys": {"primary": "depth", "secondary": None, "wrist": None},
         "state_obs_keys": ["state"],

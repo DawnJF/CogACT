@@ -70,7 +70,7 @@ class TrainerStrategy:
         max_grad_norm: float,
         lr_scheduler_type: str,
         warmup_ratio: float,
-        worker_init_fn: Optional[Callable[[int], None]] = None,
+        deepspeed: Optional[str] = None,
         offload_optimizer: bool = False,
         **kwargs,
     ) -> None:
@@ -85,7 +85,7 @@ class TrainerStrategy:
         self.max_grad_norm = max_grad_norm
         self.lr_scheduler_type = lr_scheduler_type
         self.warmup_ratio = warmup_ratio
-        self.worker_init_fn = worker_init_fn
+        self.deepspeed = deepspeed
         self.offload_optimizer = offload_optimizer
 
         # 计算梯度累积步数
@@ -122,6 +122,9 @@ class TrainerStrategy:
         if torch.distributed.is_initialized():
             overwatch.info(f"Distributed world size: {torch.distributed.get_world_size()}")
 
+        overwatch.info(f"deepspeed: {self.deepspeed}")
+        overwatch.info(f"learning_rate: {self.learning_rate}")
+
         # 计算训练总步数
         if self.max_steps is None:
             num_examples = len(vla_dataset)
@@ -144,13 +147,14 @@ class TrainerStrategy:
             # max_steps=num_training_steps,
             lr_scheduler_type=self.lr_scheduler_type,
             warmup_steps=warmup_steps,
-            logging_steps=5,
+            logging_steps=1,
             save_steps=save_interval,
             save_total_limit=3,
             dataloader_num_workers=0,
             report_to=[],  # 禁用wandb等报告
             optim="adamw_torch",
             bf16=True,
+            deepspeed=self.deepspeed,
         )
 
         # 创建自定义Trainer
